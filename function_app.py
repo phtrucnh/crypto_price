@@ -1393,3 +1393,64 @@ def ProcessExistingBlobs(myTimer: func.TimerRequest):
                 logging.error(f"Failed to process blob {blob.name}: {e}")
     
     logging.info("Existing blobs processing completed")
+
+@app.route(route="test-sql", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def TestSQL(req: func.HttpRequest) -> func.HttpResponse:
+    """Test SQL connection and permissions with detailed info"""
+    results = []
+    
+    try:
+        # Test 1: Check if connection string exists
+        if not SQL_CONN_STR:
+            results.append("❌ SQL_CONNECTION_STRING environment variable is not set")
+            return func.HttpResponse("\n".join(results), status_code=500)
+        else:
+            results.append("✅ SQL_CONNECTION_STRING: Found")
+        
+        # Test 2: Test connection
+        conn = get_sql_connection()
+        results.append("✅ SQL Connection: OK")
+        
+        cursor = conn.cursor()
+        
+        # Test 3: Check tables and counts
+        cursor.execute("""
+            SELECT TABLE_NAME 
+            FROM INFORMATION_SCHEMA.TABLES 
+            WHERE TABLE_SCHEMA = 'dbo'
+            ORDER BY TABLE_NAME
+        """)
+        tables = [row[0] for row in cursor.fetchall()]
+        results.append(f"✅ Tables found: {', '.join(tables)}")
+        
+        # Test 4: Check Symbol table specifically
+        cursor.execute("SELECT COUNT(*) as count, symbol FROM dbo.Symbol GROUP BY symbol ORDER BY count DESC")
+        symbol_counts = cursor.fetchall()
+        results.append("📊 Symbol table counts:")
+        for count, symbol in symbol_counts:
+            results.append(f"   {symbol}: {count} records")
+        
+        # Test 5: Try a simple insert test
+        try:
+            test_symbol = 'TEST' + str(int(time.time()))[-6:] + 'USDT'
+            cursor.execute("""
+                INSERT INTO dbo.Symbol (symbol, base_asset, quote_asset, is_perp, is_active)
+                VALUES (?, 'TEST', 'USDT', 0, 1)
+            """, test_symbol)
+            conn.commit()
+            results.append(f"✅ Insert test: Created symbol {test_symbol}")
+            
+            # Clean up
+            cursor.execute("DELETE FROM dbo.Symbol WHERE symbol = ?", test_symbol)
+            conn.commit()
+            results.append(f"✅ Cleanup: Removed test symbol {test_symbol}")
+            
+        except Exception as e:
+            conn.rollback()
+            results.append(f"❌ Insert test failed: {str(e)}")
+        
+        conn.close()
+        return func.HttpResponse("\n".join(results), status_code=200)
+        
+    except Exception as e:
+        return func.HttpResponse(f"❌ SQL Connection Failed: {str(e)}", status_code=500)

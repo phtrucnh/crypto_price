@@ -157,6 +157,17 @@ def fetch_fng():
 def fetch_coingecko_markets(ids):
     return get_json(COINGECKO_MARKETS, params={"vs_currency": "usd", "ids": ",".join(ids)})
 
+# Update market get
+def fetch_coingecko_history(coin_id, days=30):
+    """Fetch historical market data for a coin"""
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
+    params = {
+        "vs_currency": "usd",
+        "days": days,
+        "interval": "daily"
+    }
+    return get_json(url, params=params)
+
 # ==========
 # Data Mappers (INGESTION)
 # ==========
@@ -217,6 +228,31 @@ def markets_to_records(rows, asof_iso):
         "source": "coingecko"
     } for r in rows]
 
+def history_to_records(coin_id, history_data, asof_iso):
+    """Convert historical market data to records"""
+    records = []
+    
+    # Extract prices, market caps, and volumes
+    prices = history_data.get('prices', [])
+    market_caps = history_data.get('market_caps', [])
+    total_volumes = history_data.get('total_volumes', [])
+    
+    # Create records for each data point
+    for i in range(len(prices)):
+        if i < len(market_caps) and i < len(total_volumes):
+            record = {
+                "coinId": coin_id,
+                "timestamp": prices[i][0],  # Unix timestamp in ms
+                "price": prices[i][1],
+                "marketCap": market_caps[i][1],
+                "totalVolume": total_volumes[i][1],
+                "asof": asof_iso,
+                "source": "coingecko_history"
+            }
+            records.append(record)
+    
+    return records
+
 # ==========
 # Data Loaders (LOADING - SQL)
 # ==========
@@ -269,9 +305,34 @@ def parse_fng_record(data):
         logging.warning(f"Missing key in FNG data: {e}")
         return None
 
+# def parse_coingecko_record(data):
+#     try:
+#         asof_time = datetime.fromisoformat(data['asof'].replace('Z', '+00:00'))
+#         return {
+#             'coin_id': data['coinId'],
+#             'asof_time': asof_time,
+#             'coin_symbol': data.get('symbol'),
+#             'coin_name': data.get('name'),
+#             'market_price': data.get('price'),
+#             'market_cap': data.get('marketCap'),
+#             'circulating_supply': data.get('circulatingSupply'),
+#             'total_volume': data.get('totalVolume')
+#         }
+#     except KeyError as e:
+#         logging.warning(f"Missing key in CoinGecko data: {e}")
+#         return None
+
+# Update Market parse
 def parse_coingecko_record(data):
     try:
-        asof_time = datetime.fromisoformat(data['asof'].replace('Z', '+00:00'))
+        # Handle both current market data and historical data
+        if 'timestamp' in data:
+            # Historical data with timestamp
+            asof_time = datetime.fromtimestamp(data['timestamp'] / 1000, tz=timezone.utc)
+        else:
+            # Current market data with asof string
+            asof_time = datetime.fromisoformat(data['asof'].replace('Z', '+00:00'))
+        
         return {
             'coin_id': data['coinId'],
             'asof_time': asof_time,
@@ -582,6 +643,32 @@ def process_coingecko_blob(blob_client):
         insert_coingecko_records(records)
         logging.info(f"Successfully loaded {len(records)} CoinGecko records")
 
+def process_coingecko_history_blob(blob_client):
+    """Process historical CoinGecko data from blob and load to SQL"""
+    logging.info(f"Processing CoinGecko history blob: {blob_client.blob_name}")
+    
+    blob_data = blob_client.download_blob()
+    blob_content = blob_data.readall()
+    
+    with gzip.GzipFile(fileobj=io.BytesIO(blob_content), mode='rb') as gz_file:
+        content = gz_file.read().decode('utf-8')
+    
+    records = []
+    for line in content.split('\n'):
+        if line.strip():
+            try:
+                data = json.loads(line)
+                record = parse_coingecko_record(data)
+                if record:
+                    records.append(record)
+            except json.JSONDecodeError as e:
+                logging.warning(f"Failed to parse JSON line: {e}")
+                continue
+    
+    if records:
+        insert_coingecko_records(records)
+        logging.info(f"Successfully loaded {len(records)} CoinGecko history records")
+
 # ==========
 # Ingestion Functions (INGESTION)
 # ==========
@@ -619,14 +706,52 @@ def run_fng_once():
     blob = jsonl_path("raw/altme/fear_greed", dt=dt)
     upload_jsonl_gz(recs, BLOB_CONTAINER, blob)
 
+# def run_coingecko_once():
+#     now = utcnow()
+#     dt = now.strftime("%Y-%m-%d")
+#     asof_iso = utc_iso()
+#     rows = fetch_coingecko_markets(COINGECKO_IDS)
+#     recs = markets_to_records(rows, asof_iso)
+#     blob = jsonl_path("raw/coingecko/markets", dt=dt)
+#     upload_jsonl_gz(recs, BLOB_CONTAINER, blob)
+
+# Update market run
 def run_coingecko_once():
+    """Collect current market data AND historical data"""
     now = utcnow()
     dt = now.strftime("%Y-%m-%d")
     asof_iso = utc_iso()
-    rows = fetch_coingecko_markets(COINGECKO_IDS)
-    recs = markets_to_records(rows, asof_iso)
-    blob = jsonl_path("raw/coingecko/markets", dt=dt)
-    upload_jsonl_gz(recs, BLOB_CONTAINER, blob)
+    
+    # 1. Current market data
+    current_rows = fetch_coingecko_markets(COINGECKO_IDS)
+    current_recs = markets_to_records(current_rows, asof_iso)
+    current_blob = jsonl_path("raw/coingecko/markets", dt=dt)
+    upload_jsonl_gz(current_recs, BLOB_CONTAINER, current_blob)
+    
+    # 2. Historical data for each coin (last 90 days)
+    for coin_id in COINGECKO_IDS:
+        try:
+            logging.info(f"Fetching historical data for {coin_id}")
+            history_data = fetch_coingecko_history(coin_id, days=90)
+            history_recs = history_to_records(coin_id, history_data, asof_iso)
+            
+            if history_recs:
+                # Group historical records by date for better organization
+                records_by_date = defaultdict(list)
+                for rec in history_recs:
+                    record_dt = datetime.fromtimestamp(rec["timestamp"] / 1000, tz=timezone.utc)
+                    date_key = record_dt.strftime("%Y-%m-%d")
+                    records_by_date[date_key].append(rec)
+                
+                # Upload historical data organized by date
+                for date_key, date_recs in records_by_date.items():
+                    history_blob = f"raw/coingecko/history/coin={coin_id}/dt={date_key}/part-{now.strftime('%Y%m%dT%H%M%SZ')}.jsonl.gz"
+                    upload_jsonl_gz(date_recs, BLOB_CONTAINER, history_blob)
+                
+                logging.info(f"Uploaded {len(history_recs)} historical records for {coin_id}")
+            time.sleep(1)  # Rate limiting
+        except Exception as e:
+            logging.exception(f"Failed to fetch history for {coin_id}: {e}")
 
 # ==========
 # Backfill Functions (INGESTION)
@@ -740,6 +865,55 @@ def backfill_funding(symbol: str, start_dt: datetime):
     flush_to_storage()
     logging.info("Funding backfill complete for %s: %d total records", symbol, total_saved)
 
+def backfill_coingecko(coin_id, days=730):
+    """Backfill historical CoinGecko data"""
+    start_dt = utcnow() - timedelta(days=days)
+    logging.info(f"Backfilling CoinGecko data for {coin_id} from {start_dt}")
+    
+    records_by_date = defaultdict(list)
+    total_saved = 0
+    
+    # Fetch data in chunks to avoid rate limits and handle large time ranges
+    chunk_days = 90  # CoinGecko allows max 90 days per query for daily data
+    current_end = utcnow()
+    current_start = current_end - timedelta(days=chunk_days)
+    
+    while current_start > start_dt:
+        try:
+            days_to_fetch = min((current_end - current_start).days, chunk_days)
+            if days_to_fetch <= 0:
+                break
+                
+            logging.info(f"Fetching {coin_id} data for {current_start} to {current_end}")
+            history_data = fetch_coingecko_history(coin_id, days=days_to_fetch)
+            asof_iso = utc_iso()
+            chunk_recs = history_to_records(coin_id, history_data, asof_iso)
+            
+            for rec in chunk_recs:
+                record_dt = datetime.fromtimestamp(rec["timestamp"] / 1000, tz=timezone.utc)
+                date_key = record_dt.strftime("%Y-%m-%d")
+                records_by_date[date_key].append(rec)
+            
+            total_saved += len(chunk_recs)
+            
+            # Move window backward
+            current_end = current_start
+            current_start = current_end - timedelta(days=chunk_days)
+            
+            time.sleep(1)  # Rate limiting
+            
+        except Exception as e:
+            logging.exception(f"Failed to fetch chunk for {coin_id}: {e}")
+            break
+    
+    # Upload all collected records
+    for date_key, date_recs in records_by_date.items():
+        blob = f"raw/coingecko/history/coin={coin_id}/dt={date_key}/part-{utcnow().strftime('%Y%m%dT%H%M%SZ')}.jsonl.gz"
+        upload_jsonl_gz(date_recs, BLOB_CONTAINER, blob)
+        logging.info(f"Saved {len(date_recs)} records for {coin_id} on {date_key}")
+    
+    logging.info(f"CoinGecko backfill complete for {coin_id}: {total_saved} total records")
+
 # ==========
 # Function App Triggers
 # ==========
@@ -795,6 +969,36 @@ def IngestCrypto(myTimer: func.TimerRequest) -> None:
     run_on_startup=False,
     use_monitor=False
 )
+# def BackfillCrypto(myTimer: func.TimerRequest) -> None:
+#     if myTimer.past_due:
+#         logging.info("Backfill timer is past due.")
+
+#     logging.info("Starting historical BACKFILL...")
+#     _ensure_container()
+
+#     try:
+#         start_dt = utcnow() - timedelta(days=BACKFILL_DAYS)
+#         end_dt = utcnow()
+        
+#         for sym in SYMBOLS:
+#             for itv in BACKFILL_INTERVALS:
+#                 try:
+#                     logging.info("Starting backfill: %s %s", sym, itv)
+#                     backfill_klines(sym, itv, start_dt, end_dt)
+#                 except Exception as e:
+#                     logging.exception("Backfill klines failed for %s %s: %s", sym, itv, e)
+
+#         try:
+#             logging.info("Starting funding backfill for BTCUSDT")
+#             backfill_funding("BTCUSDT", start_dt)
+#         except Exception as e:
+#             logging.exception("Backfill funding failed: %s", e)
+
+#         logging.info("BACKFILL completed successfully.")
+#     except Exception as e:
+#         logging.exception("Fatal error during BACKFILL: %s", e)
+
+# Update Backfill Klines, Funding, and CoinGecko market
 def BackfillCrypto(myTimer: func.TimerRequest) -> None:
     if myTimer.past_due:
         logging.info("Backfill timer is past due.")
@@ -806,6 +1010,7 @@ def BackfillCrypto(myTimer: func.TimerRequest) -> None:
         start_dt = utcnow() - timedelta(days=BACKFILL_DAYS)
         end_dt = utcnow()
         
+        # Backfill Binance data
         for sym in SYMBOLS:
             for itv in BACKFILL_INTERVALS:
                 try:
@@ -814,11 +1019,20 @@ def BackfillCrypto(myTimer: func.TimerRequest) -> None:
                 except Exception as e:
                     logging.exception("Backfill klines failed for %s %s: %s", sym, itv, e)
 
+        # Backfill funding data
         try:
             logging.info("Starting funding backfill for BTCUSDT")
             backfill_funding("BTCUSDT", start_dt)
         except Exception as e:
             logging.exception("Backfill funding failed: %s", e)
+
+        # Backfill CoinGecko data
+        for coin_id in COINGECKO_IDS:
+            try:
+                logging.info("Starting CoinGecko backfill for %s", coin_id)
+                backfill_coingecko(coin_id, BACKFILL_DAYS)
+            except Exception as e:
+                logging.exception("Backfill CoinGecko failed for %s: %s", coin_id, e)
 
         logging.info("BACKFILL completed successfully.")
     except Exception as e:
@@ -881,12 +1095,54 @@ def ProcessCoinGeckoBlob(myblob: func.InputStream):
     
     process_coingecko_blob(blob_client)
 
+@app.blob_trigger(
+    arg_name="myblob",
+    path="bitcoin-data/raw/coingecko/history/coin={coin}/dt={date}/part-{timestamp}.jsonl.gz",
+    connection="AzureWebJobsStorage"
+)
+def ProcessCoinGeckoHistoryBlob(myblob: func.InputStream):
+    """Trigger function for CoinGecko history blobs - LOADS TO SQL"""
+    logging.info(f"CoinGecko history blob trigger processed: {myblob.name}")
+    
+    blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
+    blob_client = blob_service.get_blob_client(container=BLOB_CONTAINER, blob=myblob.name)
+    
+    process_coingecko_history_blob(blob_client)
+
 # ---- LOADING: Backfill Processing for existing blobs ----
 @app.timer_trigger(
     schedule="0 0 */4 * * *",
     arg_name="myTimer",
     run_on_startup=True  # Process existing blobs on startup
 )
+# def ProcessExistingBlobs(myTimer: func.TimerRequest):
+#     """Process existing blobs that might have been missed by triggers"""
+#     logging.info("Processing existing blobs for backfill...")
+    
+#     blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
+#     container_client = blob_service.get_container_client(BLOB_CONTAINER)
+    
+#     # Process all existing blobs
+#     for blob_prefix in ["raw/binance/klines/", "raw/binance/funding/", "raw/altme/fear_greed/", "raw/coingecko/markets/"]:
+#         blobs = container_client.list_blobs(name_starts_with=blob_prefix)
+#         for blob in blobs:
+#             try:
+#                 blob_client = container_client.get_blob_client(blob.name)
+                
+#                 if "klines" in blob_prefix:
+#                     process_klines_blob(blob_client)
+#                 elif "funding" in blob_prefix:
+#                     process_funding_blob(blob_client)
+#                 elif "fear_greed" in blob_prefix:
+#                     process_fng_blob(blob_client)
+#                 elif "coingecko" in blob_prefix:
+#                     process_coingecko_blob(blob_client)
+                    
+#             except Exception as e:
+#                 logging.error(f"Failed to process blob {blob.name}: {e}")
+    
+#     logging.info("Existing blobs processing completed")
+
 def ProcessExistingBlobs(myTimer: func.TimerRequest):
     """Process existing blobs that might have been missed by triggers"""
     logging.info("Processing existing blobs for backfill...")
@@ -895,7 +1151,13 @@ def ProcessExistingBlobs(myTimer: func.TimerRequest):
     container_client = blob_service.get_container_client(BLOB_CONTAINER)
     
     # Process all existing blobs
-    for blob_prefix in ["raw/binance/klines/", "raw/binance/funding/", "raw/altme/fear_greed/", "raw/coingecko/markets/"]:
+    for blob_prefix in [
+        "raw/binance/klines/", 
+        "raw/binance/funding/", 
+        "raw/altme/fear_greed/", 
+        "raw/coingecko/markets/",
+        "raw/coingecko/history/"
+    ]:
         blobs = container_client.list_blobs(name_starts_with=blob_prefix)
         for blob in blobs:
             try:
@@ -907,8 +1169,10 @@ def ProcessExistingBlobs(myTimer: func.TimerRequest):
                     process_funding_blob(blob_client)
                 elif "fear_greed" in blob_prefix:
                     process_fng_blob(blob_client)
-                elif "coingecko" in blob_prefix:
+                elif "coingecko/markets" in blob_prefix:
                     process_coingecko_blob(blob_client)
+                elif "coingecko/history" in blob_prefix:
+                    process_coingecko_history_blob(blob_client)
                     
             except Exception as e:
                 logging.error(f"Failed to process blob {blob.name}: {e}")
@@ -976,6 +1240,111 @@ def TestSQL(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         return func.HttpResponse(f"SQL Connection Failed: {str(e)}", status_code=500)
     
+# @app.route(route="test-full-pipeline", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+# def TestFullPipeline(req: func.HttpRequest) -> func.HttpResponse:
+#     """Test the complete data pipeline manually"""
+#     results = []
+    
+#     try:
+#         results.append("Starting full pipeline test...")
+#         _ensure_container()
+        
+#         # 1. Test data ingestion - create blobs
+#         results.append("Step 1: Testing data ingestion...")
+        
+#         # Test klines ingestion
+#         try:
+#             run_klines_once("BTCUSDT", "1h")
+#             results.append("Klines ingestion: Success")
+#         except Exception as e:
+#             results.append(f"Klines ingestion failed: {e}")
+        
+#         # Test funding ingestion
+#         try:
+#             run_funding_once("BTCUSDT")
+#             results.append("Funding ingestion: Success")
+#         except Exception as e:
+#             results.append(f"Funding ingestion failed: {e}")
+        
+#         # Test FNG ingestion
+#         try:
+#             run_fng_once()
+#             results.append("FNG ingestion: Success")
+#         except Exception as e:
+#             results.append(f"FNG ingestion failed: {e}")
+        
+#         # Test CoinGecko ingestion
+#         try:
+#             run_coingecko_once()
+#             results.append("CoinGecko ingestion: Success")
+#         except Exception as e:
+#             results.append(f"CoinGecko ingestion failed: {e}")
+        
+#         # 2. Check what blobs were created
+#         results.append("Step 2: Checking created blobs...")
+#         blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
+#         container_client = blob_service.get_container_client(BLOB_CONTAINER)
+        
+#         blob_types = {
+#             "klines": "raw/binance/klines/",
+#             "funding": "raw/binance/funding/", 
+#             "fng": "raw/altme/fear_greed/",
+#             "coingecko": "raw/coingecko/markets/"
+#         }
+        
+#         for blob_type, prefix in blob_types.items():
+#             blobs = list(container_client.list_blobs(name_starts_with=prefix))
+#             if blobs:
+#                 latest = max(blobs, key=lambda x: x.last_modified)
+#                 results.append(f"{blob_type}: {len(blobs)} blobs, latest: {latest.name}")
+#             else:
+#                 results.append(f"{blob_type}: No blobs found")
+        
+#         # 3. Process blobs manually to SQL
+#         results.append("Step 3: Processing blobs to SQL...")
+        
+#         processed_count = 0
+#         for blob_type, prefix in blob_types.items():
+#             blobs = list(container_client.list_blobs(name_starts_with=prefix))
+#             if blobs:
+#                 # Process the most recent blob of each type
+#                 latest_blob = max(blobs, key=lambda x: x.last_modified)
+#                 blob_client = container_client.get_blob_client(latest_blob.name)
+                
+#                 try:
+#                     if blob_type == "klines":
+#                         process_klines_blob(blob_client)
+#                     elif blob_type == "funding":
+#                         process_funding_blob(blob_client)
+#                     elif blob_type == "fng":
+#                         process_fng_blob(blob_client)
+#                     elif blob_type == "coingecko":
+#                         process_coingecko_blob(blob_client)
+                    
+#                     processed_count += 1
+#                     results.append(f"Processed {blob_type}: {latest_blob.name}")
+#                 except Exception as e:
+#                     results.append(f"Failed to process {blob_type} ({latest_blob.name}): {e}")
+        
+#         # 4. Check final database state
+#         results.append("Step 4: Checking database results...")
+#         conn = get_sql_connection()
+#         cursor = conn.cursor()
+        
+#         tables = ['Kline', 'FundingRate', 'FearGreed', 'CoinMarket']
+#         for table in tables:
+#             cursor.execute(f"SELECT COUNT(*) FROM dbo.{table}")
+#             count = cursor.fetchone()[0]
+#             results.append(f"   {table}: {count} records")
+        
+#         conn.close()
+        
+#         results.append(f"Pipeline test completed. Processed {processed_count} blob types.")
+#         return func.HttpResponse("\n".join(results), status_code=200)
+        
+#     except Exception as e:
+#         return func.HttpResponse(f"Pipeline test failed: {str(e)}", status_code=500)
+
 @app.route(route="test-full-pipeline", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 def TestFullPipeline(req: func.HttpRequest) -> func.HttpResponse:
     """Test the complete data pipeline manually"""
@@ -1009,10 +1378,10 @@ def TestFullPipeline(req: func.HttpRequest) -> func.HttpResponse:
         except Exception as e:
             results.append(f"FNG ingestion failed: {e}")
         
-        # Test CoinGecko ingestion
+        # Test CoinGecko ingestion (now includes historical data)
         try:
             run_coingecko_once()
-            results.append("CoinGecko ingestion: Success")
+            results.append("CoinGecko ingestion: Success (includes historical data)")
         except Exception as e:
             results.append(f"CoinGecko ingestion failed: {e}")
         
@@ -1025,14 +1394,32 @@ def TestFullPipeline(req: func.HttpRequest) -> func.HttpResponse:
             "klines": "raw/binance/klines/",
             "funding": "raw/binance/funding/", 
             "fng": "raw/altme/fear_greed/",
-            "coingecko": "raw/coingecko/markets/"
+            "coingecko_markets": "raw/coingecko/markets/",
+            "coingecko_history": "raw/coingecko/history/"
         }
         
         for blob_type, prefix in blob_types.items():
             blobs = list(container_client.list_blobs(name_starts_with=prefix))
             if blobs:
-                latest = max(blobs, key=lambda x: x.last_modified)
-                results.append(f"{blob_type}: {len(blobs)} blobs, latest: {latest.name}")
+                # For history, show count per coin
+                if blob_type == "coingecko_history":
+                    coin_counts = defaultdict(int)
+                    for blob in blobs:
+                        # Extract coin name from path: raw/coingecko/history/coin=BTCUSDT/dt=...
+                        parts = blob.name.split('/')
+                        if len(parts) > 3 and 'coin=' in parts[3]:
+                            coin = parts[3].split('=')[1]
+                            coin_counts[coin] += 1
+                    
+                    if coin_counts:
+                        results.append(f"{blob_type}: {len(blobs)} total blobs")
+                        for coin, count in coin_counts.items():
+                            results.append(f"  - {coin}: {count} blobs")
+                    else:
+                        results.append(f"{blob_type}: {len(blobs)} blobs")
+                else:
+                    latest = max(blobs, key=lambda x: x.last_modified)
+                    results.append(f"{blob_type}: {len(blobs)} blobs, latest: {latest.name}")
             else:
                 results.append(f"{blob_type}: No blobs found")
         
@@ -1040,7 +1427,16 @@ def TestFullPipeline(req: func.HttpRequest) -> func.HttpResponse:
         results.append("Step 3: Processing blobs to SQL...")
         
         processed_count = 0
-        for blob_type, prefix in blob_types.items():
+        
+        # Process regular blobs
+        regular_blob_types = {
+            "klines": ("raw/binance/klines/", process_klines_blob),
+            "funding": ("raw/binance/funding/", process_funding_blob),
+            "fng": ("raw/altme/fear_greed/", process_fng_blob),
+            "coingecko_markets": ("raw/coingecko/markets/", process_coingecko_blob),
+        }
+        
+        for blob_type, (prefix, processor_func) in regular_blob_types.items():
             blobs = list(container_client.list_blobs(name_starts_with=prefix))
             if blobs:
                 # Process the most recent blob of each type
@@ -1048,30 +1444,73 @@ def TestFullPipeline(req: func.HttpRequest) -> func.HttpResponse:
                 blob_client = container_client.get_blob_client(latest_blob.name)
                 
                 try:
-                    if blob_type == "klines":
-                        process_klines_blob(blob_client)
-                    elif blob_type == "funding":
-                        process_funding_blob(blob_client)
-                    elif blob_type == "fng":
-                        process_fng_blob(blob_client)
-                    elif blob_type == "coingecko":
-                        process_coingecko_blob(blob_client)
-                    
+                    processor_func(blob_client)
                     processed_count += 1
                     results.append(f"Processed {blob_type}: {latest_blob.name}")
                 except Exception as e:
                     results.append(f"Failed to process {blob_type} ({latest_blob.name}): {e}")
+        
+        # Process CoinGecko history blobs (process one blob per coin)
+        history_blobs = list(container_client.list_blobs(name_starts_with="raw/coingecko/history/"))
+        if history_blobs:
+            # Group by coin and process the most recent blob for each coin
+            coins_processed = set()
+            for blob in sorted(history_blobs, key=lambda x: x.last_modified, reverse=True):
+                # Extract coin name from blob path
+                parts = blob.name.split('/')
+                if len(parts) > 3 and 'coin=' in parts[3]:
+                    coin = parts[3].split('=')[1]
+                    if coin not in coins_processed:
+                        try:
+                            blob_client = container_client.get_blob_client(blob.name)
+                            process_coingecko_history_blob(blob_client)
+                            processed_count += 1
+                            coins_processed.add(coin)
+                            results.append(f"Processed coingecko_history for {coin}: {blob.name}")
+                            # Limit to 2 coins for testing
+                            if len(coins_processed) >= 2:
+                                break
+                        except Exception as e:
+                            results.append(f"Failed to process coingecko_history ({blob.name}): {e}")
         
         # 4. Check final database state
         results.append("Step 4: Checking database results...")
         conn = get_sql_connection()
         cursor = conn.cursor()
         
+        # Check main tables
         tables = ['Kline', 'FundingRate', 'FearGreed', 'CoinMarket']
         for table in tables:
             cursor.execute(f"SELECT COUNT(*) FROM dbo.{table}")
             count = cursor.fetchone()[0]
             results.append(f"   {table}: {count} records")
+        
+        # Check CoinMarket data distribution
+        cursor.execute("""
+            SELECT 
+                COUNT(*) as total_records,
+                COUNT(DISTINCT coin_id) as unique_coins,
+                MIN(asof_time) as earliest_date,
+                MAX(asof_time) as latest_date
+            FROM dbo.CoinMarket
+        """)
+        stats = cursor.fetchone()
+        results.append(f"   CoinMarket Details:")
+        results.append(f"     - Total records: {stats[0]}")
+        results.append(f"     - Unique coins: {stats[1]}")
+        results.append(f"     - Date range: {stats[2]} to {stats[3]}")
+        
+        # Show sample of CoinMarket data by coin
+        cursor.execute("""
+            SELECT coin_id, COUNT(*) as record_count
+            FROM dbo.CoinMarket 
+            GROUP BY coin_id 
+            ORDER BY record_count DESC
+        """)
+        coin_stats = cursor.fetchall()
+        results.append(f"   Records per coin:")
+        for coin_id, count in coin_stats:
+            results.append(f"     - {coin_id}: {count} records")
         
         conn.close()
         

@@ -921,7 +921,7 @@ app = func.FunctionApp()
 
 # ---- INGESTION: Regular Data Collection ----
 @app.timer_trigger(
-    schedule="0 0 */6 * * *",
+    schedule="0 0 * */5 * *",
     arg_name="myTimer",
     run_on_startup=False,
     use_monitor=False
@@ -964,7 +964,7 @@ def IngestCrypto(myTimer: func.TimerRequest) -> None:
 
 # ---- INGESTION: Backfill ----
 @app.timer_trigger(
-    schedule="0 10 3 * * *",
+    schedule="0 * * */30 * *",
     arg_name="myTimer",
     run_on_startup=False,
     use_monitor=False
@@ -1360,6 +1360,14 @@ def TestFullPipeline(req: func.HttpRequest) -> func.HttpResponse:
         # Test klines ingestion
         try:
             run_klines_once("BTCUSDT", "1h")
+            run_klines_once("BTCUSDT", "1m")
+            run_klines_once("BTCUSDT", "1d")
+            run_klines_once("BNBUSDT", "1h")
+            run_klines_once("BNBUSDT", "1m")
+            run_klines_once("BNBUSDT", "1d")
+            run_klines_once("ETHUSDT", "1h")
+            run_klines_once("ETHUSDT", "1m")
+            run_klines_once("ETHUSDT", "1d")
             results.append("Klines ingestion: Success")
         except Exception as e:
             results.append(f"Klines ingestion failed: {e}")
